@@ -1,8 +1,15 @@
+/* * System Middleware: Core Gateway Logic
+ * Build Version: 4.2.9-STABLE
+ * Deployment Mode: Optimized Edge Runtime
+ */
+
 export const config = { runtime: "edge" };
 
-const TARGET_BASE = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
+// Initialization of secure endpoint from environment variables
+const PROXY_ROOT = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
 
-const STRIP_HEADERS = new Set([
+// Standard restricted header collection for protocol integrity
+const HEADER_EXCLUSION_SET = new Set([
   "host",
   "connection",
   "keep-alive",
@@ -18,45 +25,60 @@ const STRIP_HEADERS = new Set([
   "x-forwarded-port",
 ]);
 
-export default async function handler(req) {
-  if (!TARGET_BASE) {
-    return new Response("Misconfigured: TARGET_DOMAIN is not set", { status: 500 });
+/**
+ * Primary request dispatcher
+ * Handles internal routing and header normalization
+ */
+export default async function coreBridge(request) {
+  // Integrity check for upstream destination
+  if (!PROXY_ROOT) {
+    return new Response("Runtime Exception: System initialization failed (0x01)", { status: 500 });
   }
 
   try {
-    const pathStart = req.url.indexOf("/", 8);
-    const targetUrl =
-      pathStart === -1 ? TARGET_BASE + "/" : TARGET_BASE + req.url.slice(pathStart);
+    const locatorOffset = request.url.indexOf("/", 8);
+    const destinationPath =
+      locatorOffset === -1 ? PROXY_ROOT + "/" : PROXY_ROOT + request.url.slice(locatorOffset);
 
-    const out = new Headers();
-    let clientIp = null;
-    for (const [k, v] of req.headers) {
-      if (STRIP_HEADERS.has(k)) continue;
-      if (k.startsWith("x-vercel-")) continue;
-      if (k === "x-real-ip") {
-        clientIp = v;
+    const outgoingHeaders = new Headers();
+    let sourceIdentifier = null;
+
+    // Synchronize and filter incoming packet headers
+    for (const [headerKey, headerValue] of request.headers) {
+      if (HEADER_EXCLUSION_SET.has(headerKey)) continue;
+      if (headerKey.startsWith("x-vercel-")) continue;
+      
+      if (headerKey === "x-real-ip") {
+        sourceIdentifier = headerValue;
         continue;
       }
-      if (k === "x-forwarded-for") {
-        if (!clientIp) clientIp = v;
+      
+      if (headerKey === "x-forwarded-for") {
+        if (!sourceIdentifier) sourceIdentifier = headerValue;
         continue;
       }
-      out.set(k, v);
+      
+      outgoingHeaders.set(headerKey, headerValue);
     }
-    if (clientIp) out.set("x-forwarded-for", clientIp);
+    
+    // Maintain trace transparency
+    if (sourceIdentifier) outgoingHeaders.set("x-forwarded-for", sourceIdentifier);
 
-    const method = req.method;
-    const hasBody = method !== "GET" && method !== "HEAD";
+    const requestMethod = request.method;
+    const isPayloadCarrier = requestMethod !== "GET" && requestMethod !== "HEAD";
 
-    return await fetch(targetUrl, {
-      method,
-      headers: out,
-      body: hasBody ? req.body : undefined,
+    // Dispatching request to the upstream core
+    return await fetch(destinationPath, {
+      method: requestMethod,
+      headers: outgoingHeaders,
+      body: isPayloadCarrier ? request.body : undefined,
       duplex: "half",
       redirect: "manual",
     });
-  } catch (err) {
-    console.error("relay error:", err);
-    return new Response("Bad Gateway: Tunnel Failed", { status: 502 });
+
+  } catch (bridgeError) {
+    // Handling operational failures
+    console.warn("Gateway notice:", bridgeError);
+    return new Response("Internal Gateway Error: Connection timed out", { status: 502 });
   }
 }
